@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +19,8 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
+
+const UserAgent = "Experimental Crawler. Contact Kyle Nusbaum at kjn@9project.net"
 
 var companyLog *log.Logger
 var accessionLog *log.Logger
@@ -37,18 +41,26 @@ type Filing struct {
 	URL       string `gorm:"index:filing_cik_accession_url,unique"`
 }
 
+type FilingEntry struct {
+	ID        int
+	FilingID  int
+	CIK       int    `gorm:"index:filingentry_cik_accession_url,unique"`
+	Accession string `gorm:"index:filingentry_cik_accession_url,unique"`
+	URL       string `gorm:"index:filingentry_cik_accession_url,unique"`
+}
+
 //fmt.Printf("Fact: %s:%s (type: %s) from entity: (%v)\n", fact.XMLName.Space, fact.XMLName.Local, factType, factContext.Entity)
 type Fact struct {
-	CIK       int
-	FilingID  int
-	Space     string
-	Local     string
-	Type      string
-	Value     float64
-	Unit      string
-	Immediate time.Time
-	Start     time.Time
-	End       time.Time
+	CIK           int
+	FilingEntryID int
+	Space         string
+	Local         string
+	Type          string
+	Value         float64
+	Unit          string
+	Immediate     time.Time
+	Start         time.Time
+	End           time.Time
 }
 
 // LoadCompanies downloads the list of companies' tickers and CIK numbers from the SEC and updates the database.
@@ -95,6 +107,9 @@ func main() {
 	if err := db.AutoMigrate(&Filing{}); err != nil {
 		log.Fatalf("Error migrating: %v\n", err)
 	}
+	if err := db.AutoMigrate(&FilingEntry{}); err != nil {
+		log.Fatalf("Error migrating: %v\n", err)
+	}
 	if err := db.AutoMigrate(&Fact{}); err != nil {
 		log.Fatalf("Error migrating: %v\n", err)
 	}
@@ -106,26 +121,26 @@ func main() {
 		log.Fatalf("Failed to create company log")
 	}
 	defer f.Close()
-	companyLog = log.New(f, "COMPANY ", 0)
+	companyLog = log.New(f, "COMPANY ", log.Ldate|log.Ltime)
 	f, err = os.Create("accession.log")
 	if err != nil {
 		log.Fatalf("Failed to create accession log")
 	}
 	defer f.Close()
-	accessionLog = log.New(f, "ACCESSION ", 0)
+	accessionLog = log.New(f, "ACCESSION ", log.Ldate|log.Ltime)
 	f, err = os.Create("fact.log")
 	if err != nil {
 		log.Fatalf("Failed to create fact log")
 	}
 	defer f.Close()
-	factLog = log.New(f, "FACT ", 0)
+	factLog = log.New(f, "FACT ", log.Ldate|log.Ltime)
 
 	f, err = os.Create("fetch.log")
 	if err != nil {
 		log.Fatalf("Failed to create fetch log")
 	}
 	defer f.Close()
-	fetchLog = log.New(f, "FETCH ", 0)
+	fetchLog = log.New(f, "FETCH ", log.Ldate|log.Ltime)
 
 	var companies []Company
 	//tx := db.Where("cik = ?", 51143).Find(&companies)
@@ -134,46 +149,74 @@ func main() {
 		log.Fatalf("Failed to query companies: %v", err)
 	}
 
-	workChan := make(chan func(), 10)
+	workChan := make(chan func(), 1)
 	var wg sync.WaitGroup
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 10; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for f := range workChan {
 				f()
 			}
+			fmt.Printf("Shutting down worker\n")
 		}()
 	}
 
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt)
+	// 	go func() {
+	// 		for sig := range c {
+	// 			// sig is a ^C, handle it
+	// 		}
+	// 	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+loop:
 	for i, c := range companies {
 		cc := c
 		ii := i
-		workChan <- func() {
-			companyLog.Printf("Processing company %v (CIK: %d) (%d/%d)", cc.Name, cc.CIK, ii, len(companies))
-			processCompany(db, cc.CIK)
-			companyLog.Printf("Finished company %v (CIK: %d) (%d/%d)", cc.Name, cc.CIK, ii, len(companies))
+		select {
+		case workChan <- func(i int, c Company) func() {
+			return func() {
+				companyLog.Printf("Processing company %v (CIK: %d) (%d/%d)", cc.Name, cc.CIK, ii, len(companies))
+				processCompany(ctx, db, cc.CIK)
+				companyLog.Printf("Finished company %v (CIK: %d) (%d/%d)", cc.Name, cc.CIK, ii, len(companies))
+			}
+		}(i, c):
+		case <-sigc:
+			companyLog.Printf("Shutting down...")
+			fmt.Printf("Shutting down...")
+			cancel()
+			go func() {
+				<-sigc
+				os.Exit(1)
+			}()
+			break loop
 		}
+
 	}
 	close(workChan)
 	companyLog.Printf("Waiting for Companies to finish.\n")
 	wg.Wait()
 }
 
-func processCompany(db *gorm.DB, cik int) error {
+func processCompany(ctx context.Context, db *gorm.DB, cik int) error {
 	ss, err := listaccession(cik)
 	if err != nil {
 		return err
 	}
 	for _, s := range ss {
-		ss2, err := listxmlcontents(cik, s)
+		if ctx.Err() != nil {
+			return nil
+		}
+		ss2, filing, err := listxmlcontents(db, cik, s)
 		if err != nil {
-			companyLog.Printf("Failed to list XML files for CIK %d: %v\n", cik, err)
+			companyLog.Printf("Failed to list XML files for CIK: %v, accession: %s: %v\n", cik, s, err)
 			continue
 		}
 		for _, s2 := range ss2 {
-			accessionLog.Printf("Dir: %v\n", s2)
-			err = parse(db, cik, s, s2)
+			accessionLog.Printf("Processing File: %v\n", s2)
+			err = parse(db, filing.ID, cik, s, s2)
 			if err != nil {
 				accessionLog.Printf("Failed to parse %v: %v\n", s2, err)
 			}
@@ -237,7 +280,7 @@ func listaccession(cik int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	r.Header.Add("User-Agent", "Experimental Crawler. Contact Kyle Nusbaum at kjn@9project.net")
+	r.Header.Add("User-Agent", UserAgent)
 
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
@@ -264,17 +307,29 @@ func listaccession(cik int) ([]string, error) {
 	return ss, nil
 }
 
-func listxmlcontents(cik int, accession string) ([]string, error) {
-	waitForLimit(fmt.Sprintf("Listing All XML Files for CIK %d, Accession %s", cik, accession))
-	r, err := http.NewRequest("GET", fmt.Sprintf("https://www.sec.gov/Archives/edgar/data/%d/%s/index.xml", cik, accession), nil)
-	if err != nil {
-		return nil, err
+func listxmlcontents(db *gorm.DB, cik int, accession string) ([]string, *Filing, error) {
+	url := fmt.Sprintf("https://www.sec.gov/Archives/edgar/data/%d/%s/index.xml", cik, accession)
+	filing := Filing{
+		CIK:       cik,
+		Accession: accession,
+		URL:       url,
 	}
-	r.Header.Add("User-Agent", "Experimental Crawler. Contact Kyle Nusbaum at kjn@9project.net")
+
+	result := db.Create(&filing)
+	if result.Error != nil {
+		return nil, nil, result.Error
+	}
+
+	waitForLimit(fmt.Sprintf("Listing All XML Files for CIK %d, Accession %s", cik, accession))
+	r, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	r.Header.Add("User-Agent", UserAgent)
 
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 
@@ -282,7 +337,7 @@ func listxmlcontents(cik int, accession string) ([]string, error) {
 	var m DirectoryElem
 	err = d.Decode(&m)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	var ss []string
 	for _, i := range m.Items {
@@ -290,17 +345,28 @@ func listxmlcontents(cik int, accession string) ([]string, error) {
 			ss = append(ss, fmt.Sprintf("https://www.sec.gov%s", i.Href))
 		}
 	}
-	return ss, nil
+	return ss, &filing, nil
 }
 
-func parse(db *gorm.DB, cik int, accession string, url string) error {
+func parse(db *gorm.DB, filingID int, cik int, accession string, url string) error {
+	filing := FilingEntry{
+		FilingID:  filingID,
+		CIK:       cik,
+		Accession: accession,
+		URL:       url,
+	}
+	result := db.Create(&filing)
+	if result.Error != nil {
+		return result.Error
+	}
+
 	waitForLimit(fmt.Sprintf("Processing XML File from CIK %d, Accession %s, (%s)", cik, accession, url))
 	var processed xbrl.XBRL
 	r, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
 	}
-	r.Header.Add("User-Agent", "Experimental Crawler. Contact Kyle Nusbaum at kjn@9project.net")
+	r.Header.Add("User-Agent", UserAgent)
 
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
@@ -314,18 +380,6 @@ func parse(db *gorm.DB, cik int, accession string, url string) error {
 	if err != nil {
 		return err
 	}
-
-	filing := Filing{
-		CIK:       cik,
-		Accession: accession,
-		URL:       url,
-	}
-
-	result := db.Create(&filing)
-	if result.Error != nil {
-		return result.Error
-	}
-	accessionLog.Printf("Filing ID: %v\n", filing.ID)
 
 	insertFacts := make([]Fact, 0, len(processed.Facts))
 	for _, fact := range processed.Facts {
@@ -351,13 +405,13 @@ func parse(db *gorm.DB, cik int, accession string, url string) error {
 		//	fmt.Printf("Fact: %#v (%v, %v, %v, %v)\n", fact, factType, factContext, factUnit, numericValue)
 
 		f := Fact{
-			CIK:      cik,
-			FilingID: filing.ID,
-			Space:    fact.XMLName.Space,
-			Local:    fact.XMLName.Local,
-			Type:     string(factType),
-			Value:    numericValue,
-			Unit:     factUnit.String(),
+			CIK:           cik,
+			FilingEntryID: filing.ID,
+			Space:         fact.XMLName.Space,
+			Local:         fact.XMLName.Local,
+			Type:          string(factType),
+			Value:         numericValue,
+			Unit:          factUnit.String(),
 		}
 		switch factContext.Period.Type() {
 		case xbrl.PeriodTypeDuration:
